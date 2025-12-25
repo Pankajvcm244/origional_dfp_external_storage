@@ -59,7 +59,7 @@
    "type": "Link"
   }
  ],
- "modified": "2023-06-18 10:18:28.101166",
+ "modified": "2025-10-18 13:34:21.294400",
  "modified_by": "Administrator",
  "module": "DFP External Storage",
  "name": "DFP S3 Storage",
@@ -69,7 +69,7 @@
  "public": 1,
  "quick_lists": [],
  "roles": [],
- "sequence_id": 3.0,
+ "sequence_id": 9.0,
  "shortcuts": [],
  "title": "DFP S3 Storage"
 }

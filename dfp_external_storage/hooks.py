@@ -124,6 +124,7 @@ doc_events = {
 		# "on_update": "dfp_external_storage.dfp_external_storage.doctype.dfp_external_storage.dfp_external_storage.hook_file_on_update",
 		"before_save": "dfp_external_storage.dfp_external_storage.doctype.dfp_external_storage.dfp_external_storage.hook_file_before_save",
 		"on_rename": "dfp_external_storage.dfp_external_storage.doctype.dfp_external_storage.dfp_external_storage.hook_file_on_rename",
+		"before_delete": "dfp_external_storage.dfp_external_storage.doctype.dfp_external_storage.dfp_external_storage.hook_file_before_delete",
 		"after_delete": "dfp_external_storage.dfp_external_storage.doctype.dfp_external_storage.dfp_external_storage.hook_file_after_delete",
 	}
 }

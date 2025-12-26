@@ -501,13 +501,58 @@ class DFPExternalStorageFile(File):
     def __init__(self, *args, **kwargs):
         super(DFPExternalStorageFile, self).__init__(*args, **kwargs)
 
+    def before_insert(self):
+        """
+        Called before inserting a new File document.
+        
+        Handles file reuse (amendment/library) by detecting if the file_url
+        references an existing S3 file and setting is_remote_file flag.
+        
+        This runs BEFORE validation, so we can set flags to bypass URL validation.
+        This aligns with Frappe's default behavior of copying file_url without custom fields.
+        """
+        # Check if this is a file reuse case (amendment/library attachment)
+        # Frappe copies file_url but not custom fields, so we detect S3 files by checking
+        # if another File with this file_url has S3 metadata
+        if self.file_url and not self.dfp_external_storage_s3_key:
+            # Check if this file_url points to an S3-backed file
+            original = frappe.db.get_value(
+                "File",
+                {"file_url": self.file_url, "dfp_external_storage_s3_key": ["!=", ""]},
+                ["name"],
+                as_dict=True
+            )
+            
+            if original:
+                # File reuse detected: Mark as remote to bypass URL validation
+                # Set flag that will be used in is_remote_file property and validate_file_on_disk
+                self.flags.is_remote_file = True
+                self.flags.is_s3_reference = True  # Additional flag for clarity
+                
+                frappe.logger().info(
+                    f"S3 file reuse: File {self.name} references {original.name} via {self.file_url}"
+                )
+        
+        # Call parent before_insert
+        super(DFPExternalStorageFile, self).before_insert()
+
     @property
     def is_remote_file(self):
-        return (
-            True
-            if self.dfp_external_storage_s3_key
-            else super(DFPExternalStorageFile, self).is_remote_file
-        )
+        """
+        Override is_remote_file property to handle both:
+        1. Files with S3 keys (actual S3 files)
+        2. Files that reference other S3 files via file_url (reused files)
+        """
+        # Check if flag was set in before_insert (for reused files)
+        if hasattr(self.flags, 'is_remote_file') and self.flags.is_remote_file:
+            return True
+        
+        # Check if this file has S3 metadata (actual S3 file)
+        if self.dfp_external_storage_s3_key:
+            return True
+        
+        # Fall back to parent implementation
+        return super(DFPExternalStorageFile, self).is_remote_file
 
     @cached_property
     def dfp_external_storage_doc(self):
@@ -983,18 +1028,34 @@ class DFPExternalStorageFile(File):
             frappe.throw(error_msg)
 
     def validate_file_on_disk(self):
-        return (
-            True
-            if self.dfp_is_s3_remote_file()
-            else super(DFPExternalStorageFile, self).validate_file_on_disk()
-        )
+        """
+        Validate file exists on disk.
+        
+        Skip validation for:
+        1. Actual S3 files (have dfp_external_storage_s3_key)
+        2. Reused S3 files (reference other S3 files via file_url)
+        
+        Aligns with Frappe's is_remote_file behavior.
+        """
+        # Skip validation for S3 files (actual or referenced)
+        if self.is_remote_file:
+            return True
+        
+        # For local files, run normal validation
+        return super(DFPExternalStorageFile, self).validate_file_on_disk()
 
     def exists_on_disk(self):
-        return (
-            False
-            if self.dfp_is_s3_remote_file()
-            else super(DFPExternalStorageFile, self).exists_on_disk()
-        )
+        """
+        Check if file exists on local disk.
+        
+        Returns False for S3 files (actual or referenced) since they're not on disk.
+        """
+        # S3 files (actual or referenced) don't exist on local disk
+        if self.is_remote_file:
+            return False
+        
+        # For local files, check disk
+        return super(DFPExternalStorageFile, self).exists_on_disk()
 
     @frappe.whitelist()
     def optimize_file(self):
@@ -1070,72 +1131,22 @@ def hook_file_before_save(doc, method):
     """
     This method is called before the document is saved to DB (insert or update row)
     Critical fields: dfp_external_storage_s3_key, dfp_external_storage and file_url
+    
+    Aligns with Frappe's default behavior:
+    - For file reuse (amendment/library): Frappe copies file_url, we skip upload
+    - For new uploads: Upload to S3 if storage is selected
     """
     previous = doc.get_doc_before_save()
 
     if not previous:
-        # NEW "File": Detect file reuse (amendment/library) - has file_url but no S3 key
-        if doc.file_url and not doc.dfp_external_storage_s3_key:
-            # Find original file with same file_url that has S3 metadata
-            original = frappe.db.get_value(
-                "File",
-                {"file_url": doc.file_url, "dfp_external_storage_s3_key": ["!=", ""]},
-                ["dfp_external_storage", "dfp_external_storage_s3_key"],
-                as_dict=True
-            )
-            
-            if original:
-                # Copy S3 metadata (share same S3 object)
-                doc.dfp_external_storage = original.dfp_external_storage
-                doc.dfp_external_storage_s3_key = original.dfp_external_storage_s3_key
-                
-                # Generate NEW file_url with NEW File ID
-                doc.file_url = f"/{DFP_EXTERNAL_STORAGE_URL_SEGMENT_FOR_FILE_LOAD}/{doc.name}/{doc.file_name}"
-                
-                # Update attached document's field if applicable
-                if doc.attached_to_doctype and doc.attached_to_name and doc.attached_to_field:
-                    frappe.db.set_value(
-                        doc.attached_to_doctype,
-                        doc.attached_to_name,
-                        doc.attached_to_field,
-                        doc.file_url,
-                        update_modified=False
-                    )
-                
-                frappe.logger().info(
-                    f"File reuse detected: Copied S3 metadata from original to {doc.name}. "
-                    f"S3 key: {doc.dfp_external_storage_s3_key}"
-                )
-                
-                return  # Skip upload - file already exists in S3
+        # NEW "File": Check if this is a reused S3 file
+        # The is_s3_reference flag was set in before_insert if this file references an S3 file
+        if hasattr(doc.flags, 'is_s3_reference') and doc.flags.is_s3_reference:
+            # File reuse: Skip upload, DFP fields already empty (Frappe doesn't copy custom fields)
+            return
         
-        # NEW "File": Case 1: remote selected => upload to remote and continue "File" flow
+        # NEW "File": Upload to S3 if storage is selected
         doc.dfp_external_storage_upload_file()
-        
-        # NEW "File": Case 2: File copied during amendment - fix file_url if needed
-        # Check if file_url was copied from another file and needs to be updated
-        if doc.file_url and doc.dfp_external_storage_s3_key:
-            import re
-            # Check if file_url matches DFP External Storage pattern: /file/{file_id}/{file_name}
-            dfp_file_url_pattern = r"^/file/([^/]+)/(.+)$"
-            match = re.match(dfp_file_url_pattern, doc.file_url)
-            
-            if match:
-                old_file_id = match.group(1)
-                # If the file_id in URL doesn't match the current file's name, fix it
-                if old_file_id != doc.name:
-                    # Update file_url with the new file ID
-                    doc.file_url = f"/{DFP_EXTERNAL_STORAGE_URL_SEGMENT_FOR_FILE_LOAD}/{doc.name}/{doc.file_name}"
-                    
-                    # Also update the attached document's field if it references this file
-                    if doc.attached_to_doctype and doc.attached_to_name and doc.attached_to_field:
-                        frappe.db.set_value(
-                            doc.attached_to_doctype,
-                            doc.attached_to_name,
-                            doc.attached_to_field,
-                            doc.file_url,
-                            update_modified=False
-                        )
         
         return
 
@@ -1269,8 +1280,63 @@ def hook_file_on_rename(doc, method, old_name, new_name, merge=False):
         frappe.throw(error_msg)
 
 
+def hook_file_before_delete(doc, method):
+    """
+    Called before a File document is deleted.
+    
+    Checks if other File documents reference this file's URL.
+    If references exist, prevents deletion and shows error.
+    
+    This ensures:
+    - Files used in amendments/library attachments aren't accidentally deleted
+    - Users must delete referencing files first
+    - No broken file links
+    """
+    # Only check for S3 files
+    if not doc.dfp_is_s3_remote_file():
+        return
+    
+    # Check if any other File documents reference this file's URL
+    referencing_files = frappe.get_all(
+        "File",
+        filters={
+            "file_url": doc.file_url,
+            "name": ["!=", doc.name]  # Exclude current file
+        },
+        fields=["name", "attached_to_doctype", "attached_to_name"],
+        limit=10  # Limit to 10 for performance
+    )
+    
+    if referencing_files:
+        # Build error message with details
+        ref_details = []
+        for ref in referencing_files[:5]:  # Show max 5 in error
+            if ref.attached_to_doctype and ref.attached_to_name:
+                ref_details.append(
+                    f"• File {ref.name} (attached to {ref.attached_to_doctype}: {ref.attached_to_name})"
+                )
+            else:
+                ref_details.append(f"• File {ref.name}")
+        
+        total_refs = len(referencing_files)
+        if total_refs > 5:
+            ref_details.append(f"... and {total_refs - 5} more")
+        
+        error_msg = _(
+            "Cannot delete this file because it is referenced by {0} other file(s):\n\n{1}\n\n"
+            "Please delete the referencing files first, or delete the documents they are attached to."
+        ).format(total_refs, "\n".join(ref_details))
+        
+        frappe.throw(error_msg, title=_("File is Referenced"))
+
+
 def hook_file_after_delete(doc, method):
-    "Called after a document is deleted"
+    """
+    Called after a File document is deleted.
+    
+    Deletes the S3 object only if no other File documents reference it.
+    Reference counting is handled in dfp_external_storage_delete_file().
+    """
     doc.dfp_external_storage_delete_file()
 
 

@@ -8,7 +8,7 @@ app_email = "developmentforpeople@gmail.com"
 app_license = "MIT"
 
 # Includes in <head>
-# ------------------
+# ---------------------
 
 # include js, css files in header of desk.html
 app_include_js = "dfp_external_storage.app.bundle.js"
